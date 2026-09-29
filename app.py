@@ -1,44 +1,29 @@
 """
-PDF RAG Chatbot
----------------
-Upload a PDF, then chat with it.
+PDF RAG Chatbot (Streamlit version)
+-----------------------------------
+Upload a PDF in the sidebar, then chat with it.
 
-Pipeline (same as the notebook):
-  PDF -> PyPDFLoader -> text splitter -> MiniLM embeddings -> FAISS -> Gemini
-
-Each browser session gets its own index and chat memory, so several users
-can upload different PDFs at the same time without seeing each other's data.
+Pipeline: PDF -> PyPDFLoader -> text splitter -> MiniLM embeddings -> FAISS -> Gemini
 """
 
 import os
-from functools import lru_cache
+import tempfile
 
-import gradio as gr
-from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import streamlit as st
 
-load_dotenv()  # reads GOOGLE_API_KEY from a local .env file if present
+st.set_page_config(page_title="PDF Chatbot", page_icon="📄", layout="wide")
 
 # ----------------------------------------------------------------------------
-# Settings (override with environment variables if you want)
+# Settings
 # ----------------------------------------------------------------------------
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
-TOP_K = int(os.getenv("TOP_K", "4"))
-MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "6"))  # past Q&A pairs sent to Gemini
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+TOP_K = 4
+MEMORY_TURNS = 6  # past Q&A pairs sent to Gemini
 
-# ----------------------------------------------------------------------------
-# Prompt (your notebook prompt, generalised so it works for ANY uploaded PDF)
-# ----------------------------------------------------------------------------
-PROMPT = ChatPromptTemplate.from_template(
-    """
+PROMPT = """
 You are an expert assistant that helps the user understand an uploaded PDF document.
 
 Your only source of truth is the document context below. Answer clearly and accurately.
@@ -99,37 +84,60 @@ IMPORTANT INSTRUCTIONS:
 
 ANSWER:
 """
-)
 
 
 # ----------------------------------------------------------------------------
-# Heavy objects are created once and shared by all users
+# Helpers (heavy libraries are imported lazily so the page appears immediately)
 # ----------------------------------------------------------------------------
-@lru_cache(maxsize=1)
+def get_api_key():
+    try:
+        key = st.secrets.get("AQ.Ab8RN6IefEhFppnlBi3Exv28-YfplheUIAHzVpIFgdOjjkfqvw")
+    except Exception:  # no secrets configured
+        key = None
+    return key or os.getenv("AQ.Ab8RN6IefEhFppnlBi3Exv28-YfplheUIAHzVpIFgdOjjkfqvw")
+
+
+@st.cache_resource(show_spinner="Loading embedding model (first time only)...")
 def get_embeddings():
+    from langchain_huggingface import HuggingFaceEmbeddings
+
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
 
-@lru_cache(maxsize=1)
-def get_llm():
-    api_key = os.getenv("AQ.Ab8RN6IefEhFppnlBi3Exv28-YfplheUIAHzVpIFgdOjjkfqvw")
-    if not api_key:
-        raise gr.Error(
-            "GOOGLE_API_KEY is not set. Add it to a .env file "
-            "(or as a secret if you deploy to Hugging Face Spaces)."
-        )
+@st.cache_resource
+def get_llm(api_key):
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
     return ChatGoogleGenerativeAI(model=GEMINI_MODEL, api_key=api_key)
 
 
-SPLITTER = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-)
+def build_index(pdf_bytes):
+    """Read the PDF, split it, and build a FAISS index. Returns (index, pages, chunks)."""
+    from langchain_community.document_loaders import PyPDFLoader
+    from langchain_community.vectorstores import FAISS
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_bytes)
+        path = f.name
+    try:
+        pages = PyPDFLoader(path).load()
+    finally:
+        os.remove(path)
+
+    pages = [p for p in pages if p.page_content.strip()]  # drop empty pages
+    if not pages:
+        return None, 0, 0
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    chunks = splitter.split_documents(pages)
+    index = FAISS.from_documents(chunks, get_embeddings())
+    return index, len(pages), len(chunks)
 
 
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
-def extract_text(content) -> str:
+def extract_text(content):
     """Gemini may return a str or a list of parts; always return plain text."""
     if isinstance(content, str):
         return content
@@ -144,168 +152,131 @@ def extract_text(content) -> str:
     return str(content)
 
 
-def new_session() -> dict:
-    """Empty per-user state."""
-    return {"vectorstore": None, "filename": None, "memory": []}
+# ----------------------------------------------------------------------------
+# Session state (one per browser tab, so users don't see each other's data)
+# ----------------------------------------------------------------------------
+def reset_state():
+    st.session_state.index = None
+    st.session_state.file_key = None
+    st.session_state.messages = []  # what is shown on screen
+    st.session_state.memory = []  # (role, text) pairs sent to Gemini
 
+
+if "messages" not in st.session_state:
+    reset_state()
 
 # ----------------------------------------------------------------------------
-# Step 1: user uploads a PDF -> build the index
+# Page
 # ----------------------------------------------------------------------------
-def process_pdf(file_path, session):
-    session = new_session()  # a new upload always starts a fresh conversation
+st.title("📄 Chat with your PDF")
 
-    if not file_path:
-        return session, "Upload a PDF to begin.", []
-
-    filename = os.path.basename(file_path)
-
-    try:
-        pages = PyPDFLoader(file_path).load()
-        pages = [p for p in pages if p.page_content.strip()]  # drop empty pages
-
-        if not pages:
-            return (
-                session,
-                "❌ No text could be extracted. This PDF may be scanned images "
-                "(it would need OCR first).",
-                [],
-            )
-
-        chunks = SPLITTER.split_documents(pages)
-        session["vectorstore"] = FAISS.from_documents(chunks, get_embeddings())
-        session["filename"] = filename
-
-    except gr.Error:
-        raise
-    except Exception as e:  # corrupted / encrypted PDF etc.
-        return session, f"❌ Could not read this PDF: {e}", []
-
-    status = (
-        f"✅ **{filename}** is ready — {len(pages)} pages with text, "
-        f"{len(chunks)} chunks indexed. Ask your questions below."
+api_key = get_api_key()
+if not api_key:
+    st.error(
+        "**GOOGLE_API_KEY is missing.**\n\n"
+        "On Streamlit Cloud: open **Manage app → Settings → Secrets** and add:\n\n"
+        '`GOOGLE_API_KEY = "your-key-here"`\n\n'
+        "Then reboot the app."
     )
-    greeting = [
-        {
-            "role": "assistant",
-            "content": f"I've read **{filename}**. What would you like to know about it?",
-        }
-    ]
-    return session, status, greeting
+    st.stop()
 
+# ---- Sidebar: upload ----
+with st.sidebar:
+    st.header("1. Upload a PDF")
+    uploaded = st.file_uploader("Choose a PDF file", type=["pdf"])
 
-def clear_pdf():
-    return new_session(), "Upload a PDF to begin.", []
+    if uploaded is None:
+        if st.session_state.file_key is not None:
+            reset_state()  # user removed the file
+    else:
+        file_key = (uploaded.name, uploaded.size)
+        if st.session_state.file_key != file_key:  # a new file
+            reset_state()
+            with st.spinner(f"Reading {uploaded.name}..."):
+                try:
+                    index, n_pages, n_chunks = build_index(uploaded.getvalue())
+                except Exception as e:
+                    index, n_pages, n_chunks = None, 0, 0
+                    st.error(f"Could not read this PDF: {e}")
 
+            if index is not None:
+                st.session_state.index = index
+                st.session_state.file_key = file_key
+                st.session_state.messages = [
+                    {
+                        "role": "assistant",
+                        "content": f"I've read **{uploaded.name}**. What would you like to know about it?",
+                    }
+                ]
+                st.session_state.stats = (n_pages, n_chunks)
+            elif n_pages == 0 and index is None:
+                st.warning(
+                    "No text could be extracted. This PDF may be scanned images "
+                    "(it would need OCR first)."
+                )
 
-# ----------------------------------------------------------------------------
-# Step 2: chat
-# ----------------------------------------------------------------------------
-def chat(message, history, session):
-    message = (message or "").strip()
-    if not message:
-        yield "", history, session
-        return
+        if st.session_state.index is not None:
+            n_pages, n_chunks = st.session_state.stats
+            st.success(f"✅ Ready: {n_pages} pages, {n_chunks} chunks")
 
-    history = list(history or [])
-    history.append({"role": "user", "content": message})
+    if st.button("🗑️ Clear conversation", disabled=st.session_state.index is None):
+        st.session_state.messages = st.session_state.messages[:1]
+        st.session_state.memory = []
+        st.rerun()
 
-    if not session or session.get("vectorstore") is None:
-        history.append(
-            {"role": "assistant", "content": "📎 Please upload a PDF first."}
-        )
-        yield "", history, session
-        return
+# ---- Chat history ----
+if st.session_state.index is None:
+    st.info("👈 Upload a PDF in the sidebar to start chatting.")
 
-    memory = session["memory"]
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-    # Follow-ups like "what about WHERE?" retrieve badly on their own, so
-    # include the previous question in the search query.
-    search_query = message
-    if memory:
-        search_query = f"{memory[-2][1]} {message}"  # memory[-2] = last user turn
+# ---- New question ----
+question = st.chat_input(
+    "Ask a question about the document...",
+    disabled=st.session_state.index is None,
+)
 
-    docs = session["vectorstore"].similarity_search(search_query, k=TOP_K)
+if question:
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    memory = st.session_state.memory
+
+    # Follow-ups like "what about WHERE?" search badly alone, so include the
+    # previous question in the search query.
+    search_query = question if not memory else f"{memory[-2][1]} {question}"
+    docs = st.session_state.index.similarity_search(search_query, k=TOP_K)
     context = "\n\n".join(d.page_content for d in docs)
     pages = sorted({d.metadata.get("page", 0) + 1 for d in docs})
 
     recent = memory[-MEMORY_TURNS * 2 :]
     history_text = "\n".join(f"{role}: {text}" for role, text in recent)
-
     prompt_text = PROMPT.format(
-        context=context, question=message, chat_history=history_text
+        context=context, question=question, chat_history=history_text
     )
 
-    # Stream the answer token by token
-    history.append({"role": "assistant", "content": ""})
-    answer = ""
-    try:
-        for chunk in get_llm().stream(prompt_text):
-            answer += extract_text(chunk.content)
-            history[-1]["content"] = answer
-            yield "", history, session
-    except gr.Error:
-        raise
-    except Exception as e:
-        history[-1]["content"] = f"⚠️ Something went wrong while asking Gemini: {e}"
-        yield "", history, session
-        return
+    def token_stream():
+        for chunk in get_llm(api_key).stream(prompt_text):
+            yield extract_text(chunk.content)
 
-    answer = answer.strip()
-    sources = ", ".join(f"Page {p}" for p in pages)
-    history[-1]["content"] = f"{answer}\n\n📄 **Sources:** {sources}"
+    with st.chat_message("assistant"):
+        try:
+            answer = st.write_stream(token_stream()).strip()
+            sources = ", ".join(f"Page {p}" for p in pages)
+            st.markdown(f"📄 **Sources:** {sources}")
+        except Exception as e:
+            answer = None
+            st.error(f"Something went wrong while asking Gemini: {e}")
 
-    memory.append(("User", message))
-    memory.append(("Assistant", answer))
-
-    yield "", history, session
-
-
-def clear_chat(session):
-    if session:
-        session["memory"] = []
-    return []
-
-
-# ----------------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------------
-with gr.Blocks(title="PDF Chatbot") as demo:
-    gr.Markdown(
-        "# 📄 Chat with your PDF\n"
-        "Upload a PDF, wait for the ✅ message, then ask questions about it."
-    )
-
-    session = gr.State(new_session())
-
-    with gr.Row():
-        with gr.Column(scale=1, min_width=280):
-            pdf_file = gr.File(
-                label="Upload PDF", file_types=[".pdf"], type="filepath"
-            )
-            status = gr.Markdown("Upload a PDF to begin.")
-            clear_btn = gr.Button("🗑️ Clear conversation")
-
-        with gr.Column(scale=3):
-            chatbot = gr.Chatbot(type="messages", height=520, show_label=False)
-            msg = gr.Textbox(
-                placeholder="Ask a question about the document...",
-                show_label=False,
-                container=True,
-            )
-
-    # Upload / remove the PDF
-    pdf_file.upload(
-        process_pdf, inputs=[pdf_file, session], outputs=[session, status, chatbot]
-    )
-    pdf_file.clear(clear_pdf, outputs=[session, status, chatbot])
-
-    # Send a message
-    msg.submit(chat, inputs=[msg, chatbot, session], outputs=[msg, chatbot, session])
-
-    # Clear only the conversation (keeps the PDF)
-    clear_btn.click(clear_chat, inputs=[session], outputs=[chatbot])
-
-
-if __name__ == "__main__":
-    demo.queue().launch()
+    if answer:
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": f"{answer}\n\n📄 **Sources:** {sources}",
+            }
+        )
+        memory.append(("User", question))
+        memory.append(("Assistant", answer))
