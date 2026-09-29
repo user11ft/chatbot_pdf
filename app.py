@@ -175,7 +175,7 @@ if not api_key:
     st.error(
         "**GOOGLE_API_KEY is missing.**\n\n"
         "On Streamlit Cloud: open **Manage app → Settings → Secrets** and add:\n\n"
-        '`GOOGLE_API_KEY = "your-key-here"`\n\n'
+        '`GOOGLE_API_KEY = "AQ.Ab8RN6IefEhFppnlBi3Exv28-YfplheUIAHzVpIFgdOjjkfqvw"`\n\n'
         "Then reboot the app."
     )
     st.stop()
