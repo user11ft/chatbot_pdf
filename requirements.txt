@@ -1,5 +1,4 @@
-gradio>=5.0,<6.0
-langchain>=0.3
+streamlit
 langchain-community
 langchain-core
 langchain-google-genai
@@ -8,4 +7,3 @@ langchain-text-splitters
 faiss-cpu
 pypdf
 sentence-transformers
-python-dotenv
