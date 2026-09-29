@@ -112,7 +112,7 @@ def get_embeddings():
 
 @lru_cache(maxsize=1)
 def get_llm():
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("AQ.Ab8RN6IefEhFppnlBi3Exv28-YfplheUIAHzVpIFgdOjjkfqvw")
     if not api_key:
         raise gr.Error(
             "GOOGLE_API_KEY is not set. Add it to a .env file "
